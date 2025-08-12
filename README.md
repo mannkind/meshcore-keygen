@@ -42,6 +42,8 @@ cargo build --release
 
 Found keys land in `meshcore-keys.txt` with all the juicy details: private key; public key.
 
+![example key found](static/images/example.png)
+
 ---
 
 *"In cryptography we trust, but vanity we verify."*
