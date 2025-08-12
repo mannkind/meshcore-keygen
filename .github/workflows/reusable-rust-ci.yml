@@ -1,0 +1,210 @@
+name: Rust CI/CD Reusable Workflow
+
+on:
+  workflow_call:
+    inputs:
+      rust-version:
+        description: 'Rust version to use'
+        required: false
+        default: 'stable'
+        type: string
+      artifact-name:
+        description: 'Name of the binary artifact'
+        required: true
+        type: string
+      additional-targets:
+        description: 'Additional target platforms (JSON array)'
+        required: false
+        default: '[]'
+        type: string
+      test-command:
+        description: 'Custom test command'
+        required: false
+        default: 'cargo test --verbose'
+        type: string
+      build-command:
+        description: 'Custom build command'
+        required: false
+        default: 'cargo build --verbose'
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Job 1: Build and Test (runs on PR and main push)
+  build-and-test:
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: ['${{ inputs.rust-version }}']
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+          
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ inputs.rust-version }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ inputs.rust-version }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Run tests
+        run: ${{ inputs.test-command }}
+        
+      - name: Check formatting
+        run: cargo fmt -- --check
+        
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+  # Job 2: Cross-platform Release Builds (runs only on version tags)
+  release-builds:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')
+    strategy:
+      matrix:
+        include:
+          # Default Linux targets
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_name: ${{ inputs.artifact-name }}
+            asset_name: ${{ inputs.artifact-name }}-linux-amd64
+            
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_name: ${{ inputs.artifact-name }}
+            asset_name: ${{ inputs.artifact-name }}-linux-aarch64
+            
+          # Default macOS targets
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact_name: ${{ inputs.artifact-name }}
+            asset_name: ${{ inputs.artifact-name }}-macos-amd64
+            
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact_name: ${{ inputs.artifact-name }}
+            asset_name: ${{ inputs.artifact-name }}-macos-aarch64
+            
+          # Default Windows targets
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: ${{ inputs.artifact-name }}.exe
+            asset_name: ${{ inputs.artifact-name }}-windows-amd64
+            
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: ${{ inputs.artifact-name }}.exe
+            asset_name: ${{ inputs.artifact-name }}-windows-aarch64
+            
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ inputs.rust-version }}
+          targets: ${{ matrix.target }}
+          
+      - name: Install cross-compilation dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest' && matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}-${{ inputs.rust-version }}
+          restore-keys: |
+            ${{ matrix.os }}-${{ matrix.target }}-cargo-release-${{ inputs.rust-version }}-
+            ${{ matrix.os }}-cargo-
+            
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          
+      - name: Strip binary (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          elif [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            aarch64-linux-gnu-strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          fi
+          
+      - name: Strip binary (macOS)
+        if: matrix.os == 'macos-latest'
+        run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+        
+      - name: Create archive
+        run: |
+          cd target/${{ matrix.target }}/release/
+          tar -czf ${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
+          
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz
+
+  # Job 3: Create GitHub Release (runs only on version tags)
+  create-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')
+    needs: [release-builds]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          
+      - name: Display structure of downloaded files
+        run: ls -la ./artifacts/
+        
+      - name: Upload to Existing Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            ./artifacts/${{ inputs.artifact-name }}-linux-amd64/${{ inputs.artifact-name }}-linux-amd64.tar.gz
+            ./artifacts/${{ inputs.artifact-name }}-linux-aarch64/${{ inputs.artifact-name }}-linux-aarch64.tar.gz
+            ./artifacts/${{ inputs.artifact-name }}-macos-amd64/${{ inputs.artifact-name }}-macos-amd64.tar.gz
+            ./artifacts/${{ inputs.artifact-name }}-macos-aarch64/${{ inputs.artifact-name }}-macos-aarch64.tar.gz
+            ./artifacts/${{ inputs.artifact-name }}-windows-amd64/${{ inputs.artifact-name }}-windows-amd64.tar.gz
+            ./artifacts/${{ inputs.artifact-name }}-windows-aarch64/${{ inputs.artifact-name }}-windows-aarch64.tar.gz
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

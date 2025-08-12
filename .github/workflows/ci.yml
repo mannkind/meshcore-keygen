@@ -1,0 +1,16 @@
+name: CI/CD Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+
+jobs:
+  ci-cd:
+    uses: ./.github/workflows/reusable-rust-ci.yml
+    with:
+      artifact-name: "meshcore-keygen"
+      rust-version: "stable"
